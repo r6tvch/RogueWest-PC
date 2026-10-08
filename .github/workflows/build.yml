@@ -1,0 +1,103 @@
+name: Build RogueWest PC
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-pc
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Get repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Unpack project and updates
+        run: |
+          set -e
+          shopt -s nullglob nocaseglob
+          mkdir -p work/_upd
+          ZIPS=( *.zip )
+          echo "Найдено архивов: ${#ZIPS[@]}"
+          for z in "${ZIPS[@]}"; do case "${z,,}" in *update*) ;; *) echo "проект: $z"; unzip -o -q "$z" -d work;; esac; done
+          printf '%s\n' "${ZIPS[@]}" | grep -i update | sort -V > upd.txt || true
+          while IFS= read -r z; do [ -n "$z" ] && { echo "обновление: $z"; unzip -o -q "$z" -d work/_upd_tmp; cp -rf work/_upd_tmp/. work/_upd/; rm -rf work/_upd_tmp; }; done < upd.txt
+          F=$(find work -name package.json -not -path '*/node_modules/*' -not -path 'work/_upd*' | head -1)
+          if [ -n "$F" ]; then ROOT=$(dirname "$F"); elif [ -f package.json ]; then ROOT=.; else
+            echo "::error::Не найден проект (package.json). Загрузи RogueWest-PC.zip в корень репозитория."; exit 1; fi
+          if [ -n "$(ls -A work/_upd)" ]; then
+            G=$(find work/_upd -type d -name game | head -1)
+            if [ -n "$G" ]; then cp -rf "$(dirname "$G")/." "$ROOT/"; else cp -rf work/_upd/. "$ROOT/game/"; fi
+          fi
+          if [ ! -f "$ROOT/game/index.html" ]; then echo "::error::Нет game/index.html"; exit 1; fi
+          SZ=$(wc -c < "$ROOT/game/index.html")
+          if [ "$SZ" -lt 100000 ]; then echo "::error::game/index.html подозрительно маленький ($SZ байт)"; exit 1; fi
+          echo "ROOT=$ROOT" >> $GITHUB_ENV
+          echo "Папка проекта: $ROOT, размер игры: $SZ байт"
+
+      - name: Set version
+        run: |
+          V=$(tr -d ' \r\n' < "$ROOT/game/version.txt" 2>/dev/null || true)
+          if ! echo "$V" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then V="5.0.${{ github.run_number }}"; fi
+          cd "$ROOT"
+          npm pkg set version="$V"
+          echo "VER=$V" >> $GITHUB_ENV
+          echo "Версия: $V"
+
+      - name: Cache Electron downloads
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/AppData/Local/electron/Cache
+            ~/AppData/Local/electron-builder/Cache
+          key: electron-31.7.7-eb-24.13.3
+
+      - name: Install
+        run: |
+          cd "$ROOT"
+          for i in 1 2 3; do npm install --no-audit --no-fund && break; echo "повтор $i..."; sleep 15; done
+          test -d node_modules/electron-builder
+
+      - name: Build Windows
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+        run: |
+          cd "$ROOT"
+          for i in 1 2; do npx electron-builder --win --publish never && break; echo "повтор сборки..."; sleep 10; done
+          mkdir -p "$GITHUB_WORKSPACE/out"
+          cp dist/RogueWest-Setup.exe dist/RogueWest-Portable.exe "$GITHUB_WORKSPACE/out/"
+          ls -la "$GITHUB_WORKSPACE/out"
+
+      - name: Upload to Actions
+        uses: actions/upload-artifact@v4
+        with:
+          name: RogueWest-${{ env.VER }}
+          path: out/*
+          if-no-files-found: error
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ env.VER }}-b${{ github.run_number }}
+          name: RogueWest ${{ env.VER }}
+          body: |
+            **RogueWest ${{ env.VER }}**
+            - RogueWest-Setup.exe — установщик (ярлык на рабочем столе, сохранения остаются при обновлении)
+            - RogueWest-Portable.exe — запуск без установки
+          files: out/*
+          make_latest: true
